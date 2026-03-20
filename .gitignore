@@ -1,0 +1,11 @@
+# data files
+data/raw/*.csv
+
+# python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# OS
+.DS_Store
