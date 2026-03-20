@@ -1,14 +1,15 @@
 # Northlake Analytics — Analytics Engineering Portfolio Project
 
-> A full analytics engineering simulation built to learn and demonstrate production-grade
-> data modelling using **dbt**, **Snowflake**, **Python**, and **GitHub Actions**.
+> A full analytics engineering project built to learn and demonstrate production-grade
+> data modelling using **Python** , **Snowflake** , **SQL** , and eventually **dbt** .
 
 ---
 
 ## The Business
 
 **Northlake HQ** is a fictional B2B SaaS company selling a project management tool.
-~75 accounts, mix of SMB, Mid-Market and Enterprise. Three plans: Starter, Growth, Enterprise.
+200 accounts across SMB, Mid-Market, and Enterprise segments. Six plans across monthly
+and annual billing cycles.
 
 This project simulates the real work of an analytics engineer: receiving raw data from
 multiple operational sources, cleaning and modelling it into reliable, tested, documented
@@ -18,13 +19,17 @@ marts that stakeholders can actually trust.
 
 ## Data Sources
 
-| Source     | Tool                   | Contains                             |
-|------------|------------------------|--------------------------------------|
-| App DB     | PostgreSQL             | Accounts, users, subscriptions       |
-| Stripe     | Fivetran → Snowflake   | Payments, invoices                   |
-| Hubspot    | Fivetran → Snowflake   | Contacts, deals, sales activity      |
-| Mixpanel   | Fivetran → Snowflake   | Feature usage, logins, events        |
-| Zendesk    | Fivetran → Snowflake   | Support tickets                      |
+All raw data is synthetically generated using Python (`data/generate_data.py`).
+
+| File                  | Rows    | Description                                           |
+| --------------------- | ------- | ----------------------------------------------------- |
+| `accounts.csv`        | 200     | Company accounts — the core business entity           |
+| `contacts.csv`        | 600     | Individual users linked to accounts                   |
+| `plans.csv`           | 6       | Subscription plan definitions and pricing             |
+| `subscriptions.csv`   | 220     | Account subscription records and lifecycle status     |
+| `events.csv`          | ~12,000 | Product usage events (logins, feature use, API calls) |
+| `support_tickets.csv` | 800     | Customer support interactions                         |
+| `invoices.csv`        | 220     | Billing invoices linked to subscriptions              |
 
 ---
 
@@ -32,148 +37,111 @@ marts that stakeholders can actually trust.
 
 This is not clean data. These problems were designed in to reflect real-world conditions:
 
-| # | Problem | Source | Resolution |
-|---|---------|--------|------------|
-| 1 | NULL trial_end_date | Subscriptions | Tagged: freemium + extended trials are valid NULLs |
-| 2 | Duplicate subscription rows | Subscriptions | Deduped on subscription_id using row_number() |
-| 3 | Duplicate Stripe charges | Payments | Deduped on stripe_charge_id |
-| 4 | Inconsistent segment names | Hubspot | Normalised via case statement in staging |
-| 5 | Contacts not linked to accounts | Hubspot | Flagged with is_unlinked_contact |
-| 6 | Duplicate Hubspot contacts | Hubspot | Deduplicated in intermediate layer |
-| 7 | Late-arriving Mixpanel events | Mixpanel | Both timestamps preserved, occurred_at used for analysis |
-| 8 | Tickets not linked to accounts | Zendesk | Flagged, excluded from account-level aggregations |
+| #   | Problem                                      | Source          |
+| --- | -------------------------------------------- | --------------- |
+| 1   | ~5% blank `industry`, ~3% NULL `region`      | accounts        |
+| 2   | ~20% soft-deleted rows (`is_deleted = True`) | accounts        |
+| 3   | ~4% malformed emails (missing `@`)           | contacts        |
+| 4   | ~8% NULL `job_title`, ~10% NULL `last_login` | contacts        |
+| 5   | ~3% NULL `plan_id`                           | subscriptions   |
+| 6   | ~1% duplicate rows (same `event_id`)         | events          |
+| 7   | ~5% NULL `platform`, ~10% NULL `properties`  | events          |
+| 8   | ~20% NULL `first_response_at`                | support_tickets |
+| 9   | Mixed currencies (USD, EUR, GBP, CAD)        | invoices        |
 
 ---
 
-## dbt Model Architecture
+## Project Architecture
 
 ```
-Raw (Snowflake)
+Raw CSVs (data/raw/)
     │
     ▼
-Staging (stg_)          ← 1:1 with source, cleaned and typed
-    │                      No joins. No business logic.
+Snowflake RAW schema         ← exact 1:1 load, everything VARCHAR
+    │
     ▼
-Intermediate (int_)     ← Joins across sources, rollups, enrichment
-    │                      Building blocks, not stakeholder-facing
+Snowflake STAGING schema     ← cleaned, typed, renamed (stg_ prefix)
+    │                           no joins, no business logic
     ▼
-Marts (mart_)           ← Wide, flat, tested, documented
-                           One row per business entity
-                           What stakeholders and BI tools query
+Snowflake MARTS schema       ← business-facing aggregations
+                                one row per business entity
 ```
 
-### Models built
+### Repo Structure
 
-| Model | Layer | Description |
-|-------|-------|-------------|
-| `stg_postgres__accounts` | Staging | Cleaned accounts, soft-deletes excluded |
-| `stg_postgres__subscriptions` | Staging | Deduplicated subscriptions, NULLs documented |
-| `stg_mixpanel__events` | Staging | Event stream with late-arrival handling |
-| `stg_hubspot__contacts` | Staging | Contacts with normalised segment names |
-| `int_account_usage_summary` | Intermediate | Mixpanel events rolled up to account level |
-| `mart_trial_conversion` | Mart | Trial accounts ranked by conversion likelihood |
-
----
-
-## Key Design Decisions
-
-**Why `QUALIFY row_number()` for deduplication instead of `DISTINCT`?**  
-`DISTINCT` requires all columns to match. Our duplicates differ only in `_loaded_at`.
-`row_number()` lets us pick the canonical row (earliest loaded) and discard the rest precisely.
-
-**Why keep NULL trial_end_dates instead of filtering them?**  
-Two valid business states produce NULLs: freemium accounts (no expiry) and sales-extended
-trials (expiry not yet set). Filtering them would remove the most interesting conversion
-candidates. Instead we tag them with `is_freemium` and `is_extended_trial`.
-
-**Why use `occurred_at` instead of `_loaded_at` for Mixpanel analysis?**  
-Late-arriving events still happened — they should count toward engagement metrics.
-`_loaded_at` is preserved for pipeline monitoring, not user behaviour analysis.
-
-**Why `coalesce(usage.logins, 0)` in the mart?**  
-Accounts with zero Mixpanel events produce a NULL on left join. Coalescing to 0 keeps
-them in the mart so sales can see them (a zero-engagement account is still actionable).
-
----
-
-## Conversion Score
-
-The `mart_trial_conversion` model scores every trialing account (0–100 pts):
-
-| Signal | Points | Why |
-|--------|--------|-----|
-| Invited a teammate | +25 | 60% conversion rate vs 12% without |
-| Added an integration | +20 | Strong stickiness signal |
-| Logged in on Day 1 | +15 | Day-1 engagement predicts retention |
-| Logged in on Day 3 | +10 | |
-| Logged in on Day 7 | +10 | |
-| Core feature uses | +1 each (max 15) | |
-| Has open deal | +5 | Sales already engaged |
-
-Score tiers: **High** ≥ 50 · **Medium** ≥ 25 · **Low** < 25
-
----
-
-## How to Run This Project
-
-### 1. Generate raw data
-
-```bash
-cd data_generation
-python3 generate_data.py
-# Creates CSVs in data_generation/raw_data/
+```
+northlake-analytics/
+├── README.md
+├── .gitignore
+│
+├── data/
+│   ├── raw/                      # CSVs live here locally (gitignored)
+│   └── generate_data.py          # synthetic data generator
+│
+├── ingestion/                    # scripts to load CSVs → Snowflake
+│
+├── cleaning/                     # Python data cleaning scripts
+│
+├── sql/
+│   ├── setup/                    # database, schema, warehouse, file format DDL
+│   ├── raw/                      # CREATE TABLE statements for RAW schema
+│   ├── staging/                  # stg_ transformation queries
+│   ├── intermediate/             # int_ join and enrichment queries
+│   └── marts/                    # final business-facing models
+│       ├── finance/
+│       ├── product/
+│       └── customer_success/
+│
+└── docs/
+    └── data_dictionary.md        # column definitions per table
 ```
 
-### 2. Load to Snowflake
+---
 
-```bash
-# Upload CSVs to Snowflake stages and copy into raw schema tables
-# See data_generation/load_to_snowflake.sql for setup commands
+## Snowflake Setup
+
+Three schemas following the medallion architecture:
+
+```sql
+CREATE DATABASE IF NOT EXISTS NORTHLAKE_DB;
+
+CREATE SCHEMA IF NOT EXISTS RAW;       -- exact copy of source, never edited
+CREATE SCHEMA IF NOT EXISTS STAGING;   -- cleaned, typed, renamed
+CREATE SCHEMA IF NOT EXISTS MARTS;     -- business-ready aggregations
 ```
-
-### 3. Set up dbt
-
-```bash
-cd dbt_project
-# Copy profiles.yml to ~/.dbt/profiles.yml and fill in your Snowflake credentials
-cp profiles.yml ~/.dbt/profiles.yml
-
-# Test connection
-dbt debug
-
-# Run all models
-dbt run
-
-# Run tests
-dbt test
-
-# Generate and serve docs
-dbt docs generate
-dbt docs serve
-```
-
-### 4. View the lineage DAG
-
-After running `dbt docs serve`, open http://localhost:8080 and click the
-**lineage graph** icon to see the full DAG from source to mart.
 
 ---
 
-## What's Coming (Learning Roadmap)
+## Progress Tracker
 
-- [ ] `mart_revenue` — MRR, ARR, NRR, churn rate by cohort  
-- [ ] `mart_customers` — Full customer 360 view  
-- [ ] Month 2 data drop — schema change + late data handling  
-- [ ] Quarter close — CFO asks for ARR and Net Revenue Retention  
-- [ ] GitHub Actions CI — dbt tests run on every PR  
-- [ ] dbt docs hosted on GitHub Pages  
+- [x] Generate raw synthetic data
+- [ ] Snowflake setup (database, schemas, warehouse, file format)
+- [ ] Load CSVs into RAW schema
+- [ ] Write staging SQL (clean, cast, rename)
+- [ ] Write intermediate SQL (joins, enrichment)
+- [ ] Build marts (MRR, DAU, churn, ticket SLA)
+- [ ] Data dictionary
+- [ ] dbt migration
 
 ---
 
-## Tools Used
+## Planned Marts
 
-- **dbt Core / dbt Fusion** — transformation and testing
+| Mart                     | Description                                                |
+| ------------------------ | ---------------------------------------------------------- |
+| `mrr_by_month`           | Monthly recurring revenue, expansions, contractions, churn |
+| `invoice_summary`        | Payment status, overdue rates, revenue by currency         |
+| `daily_active_users`     | Product engagement trends                                  |
+| `feature_adoption`       | Which features are used and by whom                        |
+| `churn_risk`             | Accounts showing disengagement signals                     |
+| `ticket_sla_performance` | First response time, resolution time, CSAT by category     |
+
+---
+
+## Tools
+
+- **Python** — data generation and ingestion scripts
 - **Snowflake** — cloud data warehouse
-- **Python** — data generation and ingestion scripts  
-- **GitHub Actions** — CI/CD for dbt test runs
-- **VS Code + dbt extension** — local development
+- **SQL** — all transformation logic written by hand
+- **dbt** — coming after the SQL layer is established
+- **GitHub** — version control and project tracking
